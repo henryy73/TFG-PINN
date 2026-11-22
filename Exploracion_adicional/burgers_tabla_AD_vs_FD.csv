@@ -1,0 +1,6 @@
+Metodo,Paso_h,Perdida_L,Error_L2,Tiempo_s
+Diferenciación Automática,Exacta,9.11e-06,1.81e-03,219.6
+Diferencias Finitas,1e-02,7.16e-03,4.09e-01,184.2
+Diferencias Finitas,1e-03,6.72e-03,1.80e-01,27.5
+Diferencias Finitas,1e-04,1.24e-01,6.80e-01,3.2
+Diferencias Finitas,1e-05,3.07e-01,1.02e+00,1.1

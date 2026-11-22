@@ -1,0 +1,5 @@
+Metodo,Malla_Puntos,Error_t025,Error_t075,Error_Global
+Numérico (Malla gruesa),"$N_x=64, N_t=500$",4.06e-03,1.00e+00,6.25e+109
+Numérico (Malla media),"$N_x=128, N_t=1000$",1.01e-03,1.00e+00,7.10e+151
+Numérico (Malla fina),"$N_x=512, N_t=4000$",8.18e-05,3.04e-03,2.10e-03
+PINN (Tiempo Continuo),"$N_u=100, N_f=10000$",1.59e-03,2.19e-03,1.81e-03

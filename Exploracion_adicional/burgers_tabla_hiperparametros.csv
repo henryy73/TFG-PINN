@@ -1,0 +1,14 @@
+Variable,Configuracion,MSE_u,MSE_f,Error_L2
+Optimizador,Solo Adam,5.59e-04,5.11e-03,4.09e-02
+Optimizador,Solo L-BFGS,5.72e-07,8.54e-06,1.81e-03
+Optimizador,Híbrido (Adam + L-BFGS),5.68e-07,4.58e-06,2.52e-03
+Función de Activación,tanh(x),5.72e-07,8.54e-06,1.81e-03
+Función de Activación,sin(x),6.50e-08,1.58e-06,4.26e-04
+Función de Activación,SiLU(x),2.58e-05,3.68e-05,3.77e-02
+Función de Activación,ReLU(x),1.75e-01,1.40e-02,7.45e-01
+Muestreo de Colocación,Malla Equiespaciada,2.42e-07,4.62e-06,2.26e-01
+Muestreo de Colocación,Aleatorio Uniforme,1.94e-06,1.59e-05,3.48e-03
+Muestreo de Colocación,Hipercubo Latino (LHS),5.72e-07,8.54e-06,1.81e-03
+Pesos (w_u : w_f),1 : 1 (Estándar),5.72e-07,8.54e-06,1.81e-03
+Pesos (w_u : w_f),10 : 1,1.28e-07,2.07e-05,2.37e-03
+Pesos (w_u : w_f),1 : 10,4.11e-06,3.19e-06,7.19e-03

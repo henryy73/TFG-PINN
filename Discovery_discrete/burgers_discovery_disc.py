@@ -1,14 +1,41 @@
-import torch
-import torch.nn as nn
+import os
+import random
+import warnings
 import numpy as np
 import scipy.io
+import torch
+import torch.nn as nn
 import matplotlib.pyplot as plt
 
-# CRÍTICO: Doble precisión obligatoria para métodos IRK de alto orden
-torch.set_default_dtype(torch.float64)
+warnings.filterwarnings("ignore", category=UserWarning)
 
 # ==========================================
-# 0. CUADRO DE BUTCHER (Gauss-Legendre IRK)
+# 0. CONFIGURACIÓN GLOBAL, CUDA Y SEMILLA (42)
+# ==========================================
+# Doble precisión obligatoria para esquemas IRK de Gauss-Legendre de alto orden
+torch.set_default_dtype(torch.float64)
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+set_seed(42)
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+if torch.cuda.is_available():
+    torch.cuda.init()
+    _ = torch.matmul(torch.zeros((1, 1), dtype=torch.float64, device=DEVICE), 
+                     torch.zeros((1, 1), dtype=torch.float64, device=DEVICE))
+
+print(f"Ejecutando en dispositivo: {DEVICE}" + (f" ({torch.cuda.get_device_name(0)})" if torch.cuda.is_available() else ""))
+
+# ==========================================
+# 1. CUADRO DE BUTCHER (Gauss-Legendre IRK)
 # ==========================================
 def get_implicit_rk_coeffs(q):
     nodes, weights = np.polynomial.legendre.leggauss(q)
@@ -25,197 +52,215 @@ def get_implicit_rk_coeffs(q):
             denom = np.prod(c[j] - c_other)
             L_j_vals = num / denom
             A[i, j] = np.sum(w_quad * L_j_vals)
-    return (torch.tensor(A, dtype=torch.float64), 
-            torch.tensor(b, dtype=torch.float64))
+    return (torch.tensor(A, dtype=torch.float64, device=DEVICE), 
+            torch.tensor(b, dtype=torch.float64, device=DEVICE))
 
 # ==========================================
-# 1. MODELO FÍSICO DISCRETO (Inverso)
+# 2. MODELO FÍSICO DISCRETO (Apéndice B.2 y B.3)
 # ==========================================
 class PINNDiscreteDiscovery(nn.Module):
-    def __init__(self, layers, q, dt, A, b):
+    def __init__(self, layers, q, dt, A, b, lb=-1.0, ub=1.0):
         super(PINNDiscreteDiscovery, self).__init__()
         self.q = q
         self.dt = dt
+        self.lb = lb
+        self.ub = ub
         self.register_buffer('A', A)
         self.register_buffer('b', b)
         
         self.linears = nn.ModuleList([nn.Linear(layers[i], layers[i+1]) for i in range(len(layers)-1)])
         self.activation = nn.Tanh()
 
-        # Parámetros a descubrir (inicializados arbitrariamente)
+        # Inicialización Truncated Normal de Xavier idéntica al código original de Raissi et al.
+        for m in self.linears:
+            in_dim, out_dim = m.weight.shape[1], m.weight.shape[0]
+            std = np.sqrt(2.0 / (in_dim + out_dim))
+            nn.init.trunc_normal_(m.weight, mean=0.0, std=std, a=-2.0*std, b=2.0*std)
+            nn.init.zeros_(m.bias)
+
         self.lambda_1 = nn.Parameter(torch.tensor([0.0], dtype=torch.float64))
-        self.lambda_2 = nn.Parameter(torch.tensor([-6.0], dtype=torch.float64)) # Se usará exp(lambda_2)
+        self.lambda_2 = nn.Parameter(torch.tensor([-6.0], dtype=torch.float64))
 
     def forward(self, x):
-        # La red predice las q etapas intermedias: [u^{n+c_1}, ..., u^{n+c_q}]
-        inputs = x
+        # Normalización de entradas al dominio [-1, 1]
+        H = 2.0 * (x - self.lb) / (self.ub - self.lb) - 1.0
         for i in range(len(self.linears) - 1):
-            inputs = self.activation(self.linears[i](inputs))
-        U_stages = self.linears[-1](inputs)
-        return U_stages
+            H = self.activation(self.linears[i](H))
+        return self.linears[-1](H)
 
     def net_residuals(self, x):
+        # Ecuación (B.6): Red prior sobre las q etapas [u^{n+c_1}(x), ..., u^{n+c_q}(x)]
         U_stages = self.forward(x) # (N, q)
-        
         N_u = []
         l2 = torch.exp(self.lambda_2)
         
-        # Evaluamos el operador no lineal para cada etapa (Ec. B.10)[cite: 25]
+        # Ecuación (B.10): Operador espacial no lineal N[u] = lambda_1 * u * u_x - lambda_2 * u_xx
         for j in range(self.q):
-            u_j = U_stages[:, j]
+            u_j = U_stages[:, j:j+1]
             u_j_x = torch.autograd.grad(u_j.sum(), x, retain_graph=True, create_graph=True)[0]
             u_j_xx = torch.autograd.grad(u_j_x.sum(), x, retain_graph=True, create_graph=True)[0]
-            
-            # N[u] = lambda_1 * u * u_x - lambda_2 * u_xx
-            n_j = self.lambda_1 * u_j.unsqueeze(1) * u_j_x - l2 * u_j_xx
+            n_j = self.lambda_1 * u_j * u_j_x - l2 * u_j_xx
             N_u.append(n_j)
             
         N_u_tensor = torch.cat(N_u, dim=1) # (N, q)
         
-        # Retroproyección a t^n y t^{n+1} (Ec. B.5)[cite: 23, 24]
+        # Ecuación (B.5): Proyección hacia t^n y t^{n+1}
         U_n = U_stages + self.dt * torch.matmul(N_u_tensor, self.A.T)
         A_minus_b = self.A - self.b.unsqueeze(0)
         U_n_plus_1 = U_stages + self.dt * torch.matmul(N_u_tensor, A_minus_b.T)
-        
         return U_n, U_n_plus_1
 
 def loss_function(model, x_n, u_n_train, x_n1, u_n1_train):
+    # Ecuación (B.9) del artículo: Suma de Errores Cuadráticos (SSE = SSE_n + SSE_{n+1})
     U_n_pred, _ = model.net_residuals(x_n)
     _, U_n1_pred = model.net_residuals(x_n1)
-    
-    # SSE_n y SSE_{n+1} (Ec. B.9)[cite: 25]
     sse_n = torch.sum((U_n_pred - u_n_train) ** 2)
     sse_n1 = torch.sum((U_n1_pred - u_n1_train) ** 2)
-    
     return sse_n + sse_n1
 
 # ==========================================
-# 2. PROCESAMIENTO DE DATOS (Dos Snapshots)
+# 3. CARGA DE DATOS Y BUCLE (0% y 1% RUIDO)
 # ==========================================
-data = scipy.io.loadmat(r'C:\Users\ematm\OneDrive\Desktop\TFG\Trabajo TFG propuesto\data\burgers_shock.mat') 
+MAT_PATH = r'C:\Users\ematm\OneDrive\Desktop\TFG\Trabajo TFG propuesto\data\burgers_shock.mat'
+if not os.path.exists(MAT_PATH):
+    MAT_PATH = 'burgers_shock.mat'
 
+data = scipy.io.loadmat(MAT_PATH)
 x_raw = data['x']  
 t_raw = data['t']  
-Exact = np.real(data['usol']) 
+Exact = np.real(data['usol'])  
 
-# Extraemos los dos snapshots: t^n = 0.1 y t^{n+1} = 0.9 (dt = 0.8)[cite: 25]
+# Dos snapshots en t^n = 0.1 y t^{n+1} = 0.9 (dt = 0.8), Sección B.3
 idx_t0 = np.argmin(np.abs(t_raw.flatten() - 0.1))
 idx_t1 = np.argmin(np.abs(t_raw.flatten() - 0.9))
-dt = t_raw[idx_t1, 0] - t_raw[idx_t0, 0]
+dt = float(t_raw[idx_t1, 0] - t_raw[idx_t0, 0])
 
 t_n_val = t_raw[idx_t0, 0]
 t_n1_val = t_raw[idx_t1, 0]
 
-np.random.seed(1234)
-N_n, N_n1 = 199, 201
-idx_x_n = np.random.choice(x_raw.shape[0], N_n, replace=False)
-idx_x_n1 = np.random.choice(x_raw.shape[0], N_n1, replace=False)
+q = 32
+layers = [1, 50, 50, 50, 50, q] # 4 capas ocultas con 50 neuronas (Sección B.3)
+noise_levels = [0.0, 0.01]
 
-x_n = x_raw[idx_x_n, :]
-u_n_clean = Exact[idx_x_n, idx_t0:idx_t0+1]
-
-x_n1 = x_raw[idx_x_n1, :]
-u_n1_clean = Exact[idx_x_n1, idx_t1:idx_t1+1]
-
-noise_level = 0.01 # 1% ruido[cite: 25, 26]
-np.random.seed(1234)
-u_n = u_n_clean + noise_level * np.std(u_n_clean) * np.random.randn(*u_n_clean.shape)
-u_n1 = u_n1_clean + noise_level * np.std(u_n1_clean) * np.random.randn(*u_n1_clean.shape)
-
-x_n_tensor = torch.tensor(x_n, dtype=torch.float64, requires_grad=True)
-u_n_tensor = torch.tensor(u_n, dtype=torch.float64)
-
-x_n1_tensor = torch.tensor(x_n1, dtype=torch.float64, requires_grad=True)
-u_n1_tensor = torch.tensor(u_n1, dtype=torch.float64)
-
-# ==========================================
-# 3. CONFIGURACIÓN DEL MODELO Y ENTRENAMIENTO
-# ==========================================
-q = 32 # Etapas Runge-Kutta[cite: 25]
-layers = [1, 50, 50, 50, 50, q]
-A, b = get_implicit_rk_coeffs(q)
-
-model = PINNDiscreteDiscovery(layers, q, dt, A, b)
-
-optimizer = torch.optim.LBFGS(
-    model.parameters(), lr=1.0, max_iter=10000, max_eval=10000, history_size=50,
-    tolerance_grad=1e-8, tolerance_change=1.0 * np.finfo(float).eps, line_search_fn="strong_wolfe"
-)
-
-iter_info = [0]
-
-def closure():
-    optimizer.zero_grad()
-    loss = loss_function(model, x_n_tensor, u_n_tensor, x_n1_tensor, u_n1_tensor)
-    loss.backward()
-    
-    iter_info[0] += 1
-    if iter_info[0] % 100 == 0:
-        l1_val = model.lambda_1.item()
-        l2_val = torch.exp(model.lambda_2).item()
-        print(f'L-BFGS Iter: {iter_info[0]} | SSE Loss: {loss.item():.4e} | l1: {l1_val:.4f} | l2: {l2_val:.6f}')
-        
-    return loss
-
-print(f"Iniciando descubrimiento discreto (dt={dt:.1f}, Ruido={noise_level*100}%)...")
-optimizer.step(closure)
-print("Entrenamiento finalizado.")
-
-# ==========================================
-# 4. EVALUACIÓN Y RESULTADOS
-# ==========================================
-lambda_1_pred = model.lambda_1.item()
-lambda_2_pred = torch.exp(model.lambda_2).item()
 lambda_1_exact = 1.0
 lambda_2_exact = 0.01 / np.pi
 
-error_l1 = np.abs(lambda_1_pred - lambda_1_exact) / lambda_1_exact * 100
-error_l2 = np.abs(lambda_2_pred - lambda_2_exact) / lambda_2_exact * 100
+for noise_level in noise_levels:
+    print(f"\n==================================================")
+    print(f" EJECUTANDO DESCUBRIMIENTO DISCRETO (Ruido: {noise_level*100}%)")
+    print(f"==================================================")
+    
+    set_seed(42)
+    
+    N_n, N_n1 = 199, 201
+    idx_x_n = np.random.choice(x_raw.shape[0], N_n, replace=False)
+    idx_x_n1 = np.random.choice(x_raw.shape[0], N_n1, replace=False)
 
-print(f"\n--- Resultados del Descubrimiento Discreto ---")
-print(f"Lambda 1 exacto: {lambda_1_exact:.6f}  | Predicho: {lambda_1_pred:.6f}  | Error: {error_l1:.3f}%")
-print(f"Lambda 2 exacto: {lambda_2_exact:.6f} | Predicho: {lambda_2_pred:.6f} | Error: {error_l2:.3f}%")
+    x_n = x_raw[idx_x_n, :]
+    u_n_clean = Exact[idx_x_n, idx_t0:idx_t0+1]
 
-# ==========================================
-# 5. VISUALIZACIÓN (Figura B.9 Estilo Paper)
-# ==========================================
-fig = plt.figure(figsize=(10, 7))
+    x_n1 = x_raw[idx_x_n1, :]
+    u_n1_clean = Exact[idx_x_n1, idx_t1:idx_t1+1]
 
-# 1. Mapa de calor espaciotemporal superior
-ax1 = plt.subplot2grid((3, 2), (0, 0), colspan=2)
-X_grid, T_grid = np.meshgrid(x_raw.flatten(), t_raw.flatten(), indexing='ij')
-h = ax1.imshow(Exact, interpolation='nearest', cmap='rainbow', 
-              extent=[t_raw.min(), t_raw.max(), x_raw.min(), x_raw.max()], 
-              origin='lower', aspect='auto')
-fig.colorbar(h, ax=ax1)
-# Líneas blancas verticales marcando los snapshots t^n y t^{n+1}[cite: 26]
-ax1.axvline(x=t_n_val, color='white', linewidth=2)
-ax1.axvline(x=t_n1_val, color='white', linewidth=2)
-ax1.set_xlabel('$t$')
-ax1.set_ylabel('$x$')
-ax1.set_title('$u(t, x)$', fontsize=12)
+    if noise_level > 0:
+        u_n = u_n_clean + noise_level * np.std(u_n_clean) * np.random.randn(*u_n_clean.shape)
+        u_n1 = u_n1_clean + noise_level * np.std(u_n1_clean) * np.random.randn(*u_n1_clean.shape)
+    else:
+        u_n = u_n_clean.copy()
+        u_n1 = u_n1_clean.copy()
 
-# 2. Snapshot inferior izquierdo (t = 0.10)[cite: 26]
-ax2 = plt.subplot2grid((3, 2), (1, 0), rowspan=2)
-ax2.plot(x_raw, Exact[:, idx_t0], 'b-', linewidth=2, label='Exact')
-ax2.plot(x_n, u_n, 'rx', markersize=6, label=f'Data ({N_n} points)')
-ax2.set_xlabel('$x$')
-ax2.set_ylabel('$u(t,x)$')
-ax2.set_title(f'$t = {t_n_val:.2f}$\n{N_n} training data')
-ax2.legend(loc='upper right', frameon=True)
-ax2.set_xlim([-1, 1])
-ax2.set_ylim([-1.1, 1.1])
+    x_n_tensor = torch.tensor(x_n, dtype=torch.float64, requires_grad=True, device=DEVICE)
+    u_n_tensor = torch.tensor(u_n, dtype=torch.float64, device=DEVICE)
+    x_n1_tensor = torch.tensor(x_n1, dtype=torch.float64, requires_grad=True, device=DEVICE)
+    u_n1_tensor = torch.tensor(u_n1, dtype=torch.float64, device=DEVICE)
 
-# 3. Snapshot inferior derecho (t = 0.90)[cite: 26]
-ax3 = plt.subplot2grid((3, 2), (1, 1), rowspan=2)
-ax3.plot(x_raw, Exact[:, idx_t1], 'b-', linewidth=2, label='Exact')
-ax3.plot(x_n1, u_n1, 'rx', markersize=6, label=f'Data ({N_n1} points)')
-ax3.set_xlabel('$x$')
-ax3.set_ylabel('$u(t,x)$')
-ax3.set_title(f'$t = {t_n1_val:.2f}$\n{N_n1} training data')
-ax3.legend(loc='upper right', frameon=True)
-ax3.set_xlim([-1, 1])
-ax3.set_ylim([-0.8, 0.8])
+    A, b = get_implicit_rk_coeffs(q)
+    model = PINNDiscreteDiscovery(layers, q, dt, A, b, lb=float(x_raw.min()), ub=float(x_raw.max())).to(DEVICE)
 
-plt.tight_layout()
-plt.show()
+    # Entrenamiento conjunto mediante un único L-BFGS full-batch (fiel a Raissi et al.)
+    optimizer = torch.optim.LBFGS(
+        model.parameters(), lr=1.0, max_iter=10000, max_eval=10000, history_size=50,
+        tolerance_grad=1e-8, tolerance_change=1.0 * np.finfo(float).eps, line_search_fn="strong_wolfe"
+    )
+
+    iter_info = [0]
+    def closure():
+        optimizer.zero_grad()
+        loss = loss_function(model, x_n_tensor, u_n_tensor, x_n1_tensor, u_n1_tensor)
+        loss.backward()
+        
+        iter_info[0] += 1
+        if iter_info[0] % 100 == 0:
+            l1_val = model.lambda_1.item()
+            l2_val = torch.exp(model.lambda_2).item()
+            print(f'  L-BFGS Iter: {iter_info[0]:5d} | SSE Loss: {loss.item():.4e} | l1: {l1_val:.5f} | l2: {l2_val:.6f}')
+            
+        return loss
+
+    print(f"Iniciando descubrimiento discreto (dt={dt:.1f}, Ruido={noise_level*100}%)...")
+    optimizer.step(closure)
+    print(f"Entrenamiento finalizado en {iter_info[0]} iteraciones.")
+
+    # ==========================================
+    # 4. EVALUACIÓN Y RESULTADOS
+    # ==========================================
+    lambda_1_pred = model.lambda_1.item()
+    lambda_2_pred = torch.exp(model.lambda_2).item()
+
+    error_l1 = np.abs(lambda_1_pred - lambda_1_exact) / lambda_1_exact * 100
+    error_l2 = np.abs(lambda_2_pred - lambda_2_exact) / lambda_2_exact * 100
+
+    print(f"\n--- Resultados del Descubrimiento Discreto (Ruido: {noise_level*100}%) ---")
+    print(f"Lambda 1 exacto: {lambda_1_exact:.6f}  | Predicho: {lambda_1_pred:.6f}  | Error: {error_l1:.3f}%")
+    print(f"Lambda 2 exacto: {lambda_2_exact:.6f} | Predicho: {lambda_2_pred:.6f} | Error: {error_l2:.3f}%")
+
+    # ==========================================
+    # 5. VISUALIZACIÓN EN DOS VENTANAS SEPARADAS
+    # ==========================================
+    model.eval()
+    x_eval_tensor = torch.tensor(x_raw, dtype=torch.float64, requires_grad=True, device=DEVICE)
+    U_n_pred_full, U_n1_pred_full = model.net_residuals(x_eval_tensor)
+
+    u_n_pred_profile = U_n_pred_full.detach().cpu().numpy().mean(axis=1)
+    u_n1_pred_profile = U_n1_pred_full.detach().cpu().numpy().mean(axis=1)
+
+    # VENTANA 1: Mapa de calor espaciotemporal superior (Fig. B.9 Top)
+    plt.figure(figsize=(9, 4.5))
+    h = plt.imshow(Exact, interpolation='nearest', cmap='rainbow', 
+                   extent=[t_raw.min(), t_raw.max(), x_raw.min(), x_raw.max()], 
+                   origin='lower', aspect='auto')
+    plt.colorbar(h)
+    plt.axvline(x=t_n_val, color='white', linewidth=2, linestyle='--', label=f'$t^n = {t_n_val:.2f}$')
+    plt.axvline(x=t_n1_val, color='white', linewidth=2, linestyle='--', label=f'$t^{{n+1}} = {t_n1_val:.2f}$')
+    plt.xlabel('$t$')
+    plt.ylabel('$x$')
+    plt.title(f'Mapa Espaciotemporal $u(t, x)$ y Snapshots (Ruido: {noise_level*100}%)', fontsize=12)
+    plt.legend(loc='upper right', frameon=True)
+    plt.tight_layout()
+    plt.show()
+
+    # VENTANA 2: Curvas de predicción en t = 0.10 y t = 0.90 (Fig. B.9 Middle)
+    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+
+    axes[0].plot(x_raw, Exact[:, idx_t0], 'b-', linewidth=2, label='Exact')
+    axes[0].plot(x_raw, u_n_pred_profile, 'r--', linewidth=2, label='Prediction')
+    axes[0].plot(x_n, u_n, 'kx', markersize=4, label=f'Data ({N_n} points)')
+    axes[0].set_xlabel('$x$')
+    axes[0].set_ylabel('$u(t,x)$')
+    axes[0].set_title(f'$t = {t_n_val:.2f}$ (Ruido: {noise_level*100}%)\n{N_n} training data')
+    axes[0].legend(loc='upper right', frameon=True)
+    axes[0].set_xlim([-1, 1])
+    axes[0].set_ylim([-1.1, 1.1])
+
+    axes[1].plot(x_raw, Exact[:, idx_t1], 'b-', linewidth=2, label='Exact')
+    axes[1].plot(x_raw, u_n1_pred_profile, 'r--', linewidth=2, label='Prediction')
+    axes[1].plot(x_n1, u_n1, 'kx', markersize=4, label=f'Data ({N_n1} points)')
+    axes[1].set_xlabel('$x$')
+    axes[1].set_ylabel('$u(t,x)$')
+    axes[1].set_title(f'$t = {t_n1_val:.2f}$ (Ruido: {noise_level*100}%)\n{N_n1} training data')
+    axes[1].legend(loc='upper right', frameon=True)
+    axes[1].set_xlim([-1, 1])
+    axes[1].set_ylim([-0.8, 0.8])
+
+    plt.tight_layout()
+    plt.show()
